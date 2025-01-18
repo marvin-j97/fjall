@@ -104,12 +104,10 @@ pub struct CreateOptions {
     pub(crate) max_memtable_size: u32,
 
     /// Block size of data blocks.
-    #[doc(hidden)]
-    pub data_block_size: u32,
+    pub(crate) data_block_size: u32,
 
     /// Block size of index blocks.
-    #[doc(hidden)]
-    pub index_block_size: u32,
+    pub(crate) index_block_size: u32,
 
     /// Amount of levels of the LSM tree (depth of tree).
     pub(crate) level_count: u8,
@@ -127,8 +125,7 @@ pub struct CreateOptions {
 
     pub(crate) manual_journal_persist: bool,
 
-    #[doc(hidden)]
-    pub compaction_strategy: CompactionStrategy,
+    pub(crate) compaction_strategy: CompactionStrategy,
 
     pub(crate) kv_separation: Option<KvSeparationOptions>,
 }

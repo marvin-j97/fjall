@@ -3,11 +3,12 @@
 // (found in the LICENSE-* files in the repository)
 
 use crate::{snapshot_tracker::SnapshotTracker, Instant};
+use std::sync::Arc;
 
 /// Holds a snapshot instant and automatically frees it from the snapshot tracker when dropped
 pub struct SnapshotNonce {
     pub(crate) instant: Instant,
-    tracker: SnapshotTracker,
+    tracker: Arc<SnapshotTracker>,
 }
 
 impl Clone for SnapshotNonce {
@@ -29,7 +30,7 @@ impl Drop for SnapshotNonce {
 }
 
 impl SnapshotNonce {
-    pub fn new(instant: Instant, tracker: SnapshotTracker) -> Self {
+    pub fn new(instant: Instant, tracker: Arc<SnapshotTracker>) -> Self {
         tracker.open(instant);
         Self { instant, tracker }
     }

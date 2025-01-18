@@ -4,34 +4,21 @@
 
 use crate::Instant;
 use dashmap::DashMap;
-use std::sync::{atomic::AtomicU64, Arc, RwLock};
+use std::sync::{atomic::AtomicU64, RwLock};
 
 /// Keeps track of open snapshots
 #[allow(clippy::module_name_repetitions)]
-pub struct SnapshotTrackerInner {
+pub struct SnapshotTracker {
     // TODO: maybe use rustc_hash or ahash
     pub(crate) data: DashMap<Instant, usize, xxhash_rust::xxh3::Xxh3Builder>,
 
-    #[doc(hidden)]
-    pub(crate) freed_count: AtomicU64,
+    freed_count: AtomicU64,
     safety_gap: u64,
 
-    #[doc(hidden)]
     pub(crate) lowest_freed_instant: RwLock<Instant>,
 }
 
-#[derive(Clone, Default)]
-pub struct SnapshotTracker(Arc<SnapshotTrackerInner>);
-
-impl std::ops::Deref for SnapshotTracker {
-    type Target = SnapshotTrackerInner;
-
-    fn deref(&self) -> &Self::Target {
-        &self.0
-    }
-}
-
-impl Default for SnapshotTrackerInner {
+impl Default for SnapshotTracker {
     fn default() -> Self {
         Self {
             data: DashMap::default(),
@@ -42,7 +29,7 @@ impl Default for SnapshotTrackerInner {
     }
 }
 
-impl SnapshotTrackerInner {
+impl SnapshotTracker {
     pub fn open(&self, seqno: Instant) {
         log::trace!("open snapshot {seqno}");
 
@@ -114,7 +101,7 @@ mod tests {
     #[test]
     #[allow(clippy::field_reassign_with_default)]
     fn seqno_tracker_one_shot() {
-        let mut map = SnapshotTrackerInner::default();
+        let mut map = SnapshotTracker::default();
         map.safety_gap = 5;
 
         map.open(1);
@@ -126,7 +113,7 @@ mod tests {
     #[test]
     #[allow(clippy::field_reassign_with_default)]
     fn seqno_tracker_reverse_order() {
-        let mut map = SnapshotTrackerInner::default();
+        let mut map = SnapshotTracker::default();
         map.safety_gap = 5;
 
         map.open(1);
@@ -161,7 +148,7 @@ mod tests {
     #[test]
     #[allow(clippy::field_reassign_with_default)]
     fn seqno_tracker_simple_2() {
-        let mut map = SnapshotTrackerInner::default();
+        let mut map = SnapshotTracker::default();
         map.safety_gap = 5;
 
         map.open(1);

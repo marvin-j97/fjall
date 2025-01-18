@@ -7,19 +7,18 @@ use crate::{
     compaction::manager::CompactionManager,
     config::Config,
     file::{
-        fsync_directory, FJALL_MARKER, JOURNALS_FOLDER, PARTITIONS_FOLDER, PARTITION_DELETED_MARKER,
+        fsync_directory, FJALL_MARKER, JOURNALS_FOLDER, LSM_MANIFEST_FILE, PARTITIONS_FOLDER,
+        PARTITION_CONFIG_FILE, PARTITION_DELETED_MARKER,
     },
-    flush::manager::FlushManager,
-    journal::{manager::JournalManager, writer::PersistMode, Journal},
+    flush_tracker::FlushTracker,
+    journal::{writer::PersistMode, Journal},
     monitor::Monitor,
     partition::name::is_valid_partition_name,
-    recovery::{recover_partitions, recover_sealed_memtables},
     snapshot_tracker::SnapshotTracker,
     version::Version,
-    write_buffer_manager::WriteBufferManager,
     HashMap, PartitionCreateOptions, PartitionHandle,
 };
-use lsm_tree::{AbstractTree, SequenceNumberCounter};
+use lsm_tree::{AbstractTree, AnyTree, SequenceNumberCounter};
 use std::{
     fs::{remove_dir_all, File},
     path::Path,
@@ -51,29 +50,20 @@ pub struct KeyspaceInner {
     /// Current visible sequence number
     pub(crate) visible_seqno: SequenceNumberCounter,
 
-    /// Caps write buffer size by flushing
-    /// memtables to disk segments
-    pub(crate) flush_manager: Arc<RwLock<FlushManager>>,
-
-    /// Checks on-disk journal size and flushes memtables
-    /// if needed, to garbage collect sealed journals
-    pub(crate) journal_manager: Arc<RwLock<JournalManager>>,
+    pub(crate) flush_tracker: Arc<FlushTracker>,
 
     /// Notifies flush threads
     pub(crate) flush_semaphore: Arc<Semaphore>,
 
     /// Keeps track of which partitions are most likely to be
     /// candidates for compaction
-    pub(crate) compaction_manager: CompactionManager,
+    pub(crate) compaction_manager: Arc<CompactionManager>,
 
     /// Stop signal when keyspace is dropped to stop background threads
-    pub(crate) stop_signal: lsm_tree::stop_signal::StopSignal,
+    stop_signal: lsm_tree::stop_signal::StopSignal,
 
     /// Counter of background threads
-    pub(crate) active_background_threads: Arc<AtomicUsize>,
-
-    /// Keeps track of write buffer size
-    pub(crate) write_buffer_manager: WriteBufferManager,
+    active_background_threads: Arc<AtomicUsize>,
 
     /// True if fsync failed
     pub(crate) is_poisoned: Arc<AtomicBool>,
@@ -82,7 +72,7 @@ pub struct KeyspaceInner {
     pub(crate) active_compaction_count: Arc<AtomicUsize>,
 
     #[doc(hidden)]
-    pub snapshot_tracker: SnapshotTracker,
+    pub snapshot_tracker: Arc<SnapshotTracker>,
 }
 
 impl Drop for KeyspaceInner {
@@ -117,16 +107,10 @@ impl Drop for KeyspaceInner {
         }
 
         // IMPORTANT: Break cyclic Arcs
-        self.flush_manager
-            .write()
-            .expect("lock is poisoned")
-            .clear();
+        self.flush_tracker.clear_queues();
         self.compaction_manager.clear();
         self.partitions.write().expect("lock is poisoned").clear();
-        self.journal_manager
-            .write()
-            .expect("lock is poisoned")
-            .clear();
+        self.flush_tracker.clear_items();
 
         #[cfg(feature = "__internal_whitebox")]
         crate::drop::decrement_drop_counter();
@@ -194,7 +178,7 @@ impl Keyspace {
     /// Returns the current write buffer size (active + sealed memtables).
     #[must_use]
     pub fn write_buffer_size(&self) -> u64 {
-        self.write_buffer_manager.get()
+        self.flush_tracker.buffer_size()
     }
 
     /// Returns the number of active compactions currently running.
@@ -221,10 +205,7 @@ impl Keyspace {
     /// ```
     #[must_use]
     pub fn journal_count(&self) -> usize {
-        self.journal_manager
-            .read()
-            .expect("lock is poisoned")
-            .journal_count()
+        self.flush_tracker.journal_count()
     }
 
     /// Returns the disk space usage of the journal.
@@ -232,12 +213,7 @@ impl Keyspace {
     #[must_use]
     pub fn journal_disk_space(&self) -> u64 {
         // TODO: 3.0.0 error is not handled because that would break the API...
-        self.journal.get_writer().len().unwrap_or_default()
-            + self
-                .journal_manager
-                .read()
-                .expect("lock is poisoned")
-                .disk_space_used()
+        self.journal.get_writer().len().unwrap_or_default() + self.flush_tracker.disk_space_used()
     }
 
     /// Returns the disk space usage of the entire keyspace.
@@ -357,12 +333,7 @@ impl Keyspace {
         if self.config.flush_workers_count > 0 {
             self.spawn_flush_worker()?;
 
-            for _ in 0..self
-                .flush_manager
-                .read()
-                .expect("lock is poisoned")
-                .queue_count()
-            {
+            for _ in 0..self.flush_tracker.queue_count() {
                 self.flush_semaphore.release();
             }
         }
@@ -404,10 +375,7 @@ impl Keyspace {
         // IMPORTANT: Care, locks partitions map
         self.compaction_manager.remove_partition(&handle.name);
 
-        self.flush_manager
-            .write()
-            .expect("lock is poisoned")
-            .remove_partition(&handle.name);
+        self.flush_tracker.remove_partition(&handle.name);
 
         self.partitions
             .write()
@@ -570,7 +538,7 @@ impl Keyspace {
         let active_journal = Arc::new(journal_recovery.active);
         let sealed_journals = journal_recovery.sealed;
 
-        let journal_manager = JournalManager::from_active(active_journal.path());
+        let active_path = active_journal.path();
 
         // Construct (empty) keyspace, then fill back with partition data
         let inner = KeyspaceInner {
@@ -582,30 +550,26 @@ impl Keyspace {
             ))),
             seqno: SequenceNumberCounter::default(),
             visible_seqno: SequenceNumberCounter::default(),
-            flush_manager: Arc::new(RwLock::new(FlushManager::new())),
-            journal_manager: Arc::new(RwLock::new(journal_manager)),
+            flush_tracker: Arc::new(FlushTracker::new(active_path)),
             flush_semaphore: Arc::new(Semaphore::new(0)),
-            compaction_manager: CompactionManager::default(),
+            compaction_manager: Arc::default(),
             stop_signal: lsm_tree::stop_signal::StopSignal::default(),
             active_background_threads: Arc::default(),
-            write_buffer_manager: WriteBufferManager::default(),
             is_poisoned: Arc::default(),
-            snapshot_tracker: SnapshotTracker::default(),
+            snapshot_tracker: Arc::default(),
             active_compaction_count: Arc::default(),
         };
 
         let keyspace = Self(Arc::new(inner));
 
         // Recover partitions
-        recover_partitions(&keyspace)?;
+        keyspace.recover_partitions()?;
 
         // Recover sealed memtables by walking through old journals
-        recover_sealed_memtables(
-            &keyspace,
-            &sealed_journals
-                .into_iter()
-                .map(|(_, x)| x)
-                .collect::<Vec<_>>(),
+        keyspace.flush_tracker.recover_sealed_memtables(
+            &keyspace.partitions,
+            &keyspace.seqno,
+            sealed_journals.into_iter().map(|(_, x)| x),
         )?;
 
         {
@@ -659,7 +623,7 @@ impl Keyspace {
                     );
 
                     // IMPORTANT: Add active memtable size to current write buffer size
-                    keyspace.write_buffer_manager.allocate(size);
+                    keyspace.flush_tracker.increment_buffer_size(size);
 
                     // Recover seqno
                     let maybe_next_seqno = partition
@@ -683,6 +647,102 @@ impl Keyspace {
         );
 
         Ok(keyspace)
+    }
+
+    fn recover_partitions(&self) -> crate::Result<()> {
+        use lsm_tree::coding::Decode;
+
+        let partitions_folder = self.config.path.join(PARTITIONS_FOLDER);
+
+        #[allow(clippy::significant_drop_tightening)]
+        let mut partitions_lock = self.partitions.write().expect("lock is poisoned");
+
+        for dirent in std::fs::read_dir(&partitions_folder)? {
+            let dirent = dirent?;
+            let partition_name = dirent.file_name();
+            let partition_path = dirent.path();
+
+            assert!(
+                dirent.file_type()?.is_dir(),
+                "Found stray file in partitions folder",
+            );
+
+            log::trace!("Recovering partition {:?}", partition_name);
+
+            // NOTE: Check deletion marker
+            if partition_path.join(PARTITION_DELETED_MARKER).try_exists()? {
+                log::debug!("Deleting deleted partition {:?}", partition_name);
+
+                // IMPORTANT: First, delete the manifest,
+                // once that is deleted, the partition is treated as uninitialized
+                // even if the .deleted marker is removed
+                //
+                // This is important, because if somehow `remove_dir_all` ends up
+                // deleting the `.deleted` marker first, we would end up resurrecting
+                // the partition
+                let manifest_file = partition_path.join(LSM_MANIFEST_FILE);
+                if manifest_file.try_exists()? {
+                    std::fs::remove_file(manifest_file)?;
+                }
+
+                std::fs::remove_dir_all(partition_path)?;
+                continue;
+            }
+
+            // NOTE: Check for marker, maybe the partition is not fully initialized
+            if !partition_path.join(LSM_MANIFEST_FILE).try_exists()? {
+                log::debug!("Deleting uninitialized partition {:?}", partition_name);
+                std::fs::remove_dir_all(partition_path)?;
+                continue;
+            }
+
+            let partition_name = partition_name
+                .to_str()
+                .expect("should be valid partition name");
+
+            let path = partitions_folder.join(partition_name);
+
+            let mut config_file = File::open(partition_path.join(PARTITION_CONFIG_FILE))?;
+            let recovered_config = PartitionCreateOptions::decode_from(&mut config_file)?;
+
+            let mut base_config = lsm_tree::Config::new(path)
+                .descriptor_table(self.config.descriptor_table.clone())
+                .block_cache(self.config.block_cache.clone())
+                .blob_cache(self.config.blob_cache.clone());
+
+            base_config.bloom_bits_per_key = recovered_config.bloom_bits_per_key;
+            base_config.data_block_size = recovered_config.data_block_size;
+            base_config.index_block_size = recovered_config.index_block_size;
+            base_config.bloom_bits_per_key = recovered_config.bloom_bits_per_key;
+            base_config.compression = recovered_config.compression;
+
+            if let Some(kv_opts) = &recovered_config.kv_separation {
+                base_config = base_config
+                    .blob_compression(kv_opts.compression)
+                    .blob_file_separation_threshold(kv_opts.separation_threshold)
+                    .blob_file_target_size(kv_opts.file_target_size);
+            }
+
+            let is_blob_tree = partition_path
+                .join(lsm_tree::file::BLOBS_FOLDER)
+                .try_exists()?;
+
+            let tree = if is_blob_tree {
+                AnyTree::Blob(base_config.open_as_blob_tree()?)
+            } else {
+                AnyTree::Standard(base_config.open()?)
+            };
+
+            let partition =
+                PartitionHandle::from_keyspace(self, tree, partition_name.into(), recovered_config);
+
+            // Add partition to dictionary
+            partitions_lock.insert(partition_name.into(), partition.clone());
+
+            log::trace!("Recovered partition {:?}", partition_name);
+        }
+
+        Ok(())
     }
 
     #[doc(hidden)]
@@ -714,17 +774,13 @@ impl Keyspace {
             ))),
             seqno: SequenceNumberCounter::default(),
             visible_seqno: SequenceNumberCounter::default(),
-            flush_manager: Arc::new(RwLock::new(FlushManager::new())),
-            journal_manager: Arc::new(RwLock::new(JournalManager::from_active(
-                active_journal_path,
-            ))),
+            flush_tracker: Arc::new(FlushTracker::new(active_journal_path)),
             flush_semaphore: Arc::new(Semaphore::new(0)),
-            compaction_manager: CompactionManager::default(),
+            compaction_manager: Arc::default(),
             stop_signal: lsm_tree::stop_signal::StopSignal::default(),
             active_background_threads: Arc::default(),
-            write_buffer_manager: WriteBufferManager::default(),
             is_poisoned: Arc::default(),
-            snapshot_tracker: SnapshotTracker::default(),
+            snapshot_tracker: Arc::default(),
             active_compaction_count: Arc::default(),
         };
 
@@ -838,21 +894,17 @@ impl Keyspace {
         let parallelism = self.config.flush_workers_count;
 
         crate::flush::worker::run(
-            &self.flush_manager,
-            &self.journal_manager,
+            &self.flush_tracker,
             &self.compaction_manager,
-            &self.write_buffer_manager,
             &self.snapshot_tracker,
             parallelism,
         );
     }
 
     fn spawn_flush_worker(&self) -> crate::Result<()> {
-        let flush_manager = self.flush_manager.clone();
-        let journal_manager = self.journal_manager.clone();
+        let flush_tracker = self.flush_tracker.clone();
         let compaction_manager = self.compaction_manager.clone();
         let flush_semaphore = self.flush_semaphore.clone();
-        let write_buffer_manager = self.write_buffer_manager.clone();
         let snapshot_tracker = self.snapshot_tracker.clone();
 
         let thread_counter = self.active_background_threads.clone();
@@ -870,10 +922,8 @@ impl Keyspace {
                     flush_semaphore.acquire();
 
                     crate::flush::worker::run(
-                        &flush_manager,
-                        &journal_manager,
+                        &flush_tracker,
                         &compaction_manager,
-                        &write_buffer_manager,
                         &snapshot_tracker,
                         parallelism,
                     );
@@ -1033,32 +1083,11 @@ mod tests {
         assert_eq!(0, db.segment_count());
         assert_eq!(0, db2.segment_count());
 
-        assert_eq!(
-            0,
-            keyspace
-                .journal_manager
-                .read()
-                .expect("lock is poisoned")
-                .sealed_journal_count()
-        );
+        assert_eq!(0, keyspace.flush_tracker.sealed_journal_count());
 
-        assert_eq!(
-            0,
-            keyspace
-                .flush_manager
-                .read()
-                .expect("lock is poisoned")
-                .queued_size()
-        );
+        assert_eq!(0, keyspace.flush_tracker.queued_size());
 
-        assert_eq!(
-            0,
-            keyspace
-                .flush_manager
-                .read()
-                .expect("lock is poisoned")
-                .len()
-        );
+        assert_eq!(0, keyspace.flush_tracker.task_count());
 
         for _ in 0..100 {
             db.insert(nanoid::nanoid!(), "abc")?;
@@ -1067,23 +1096,9 @@ mod tests {
 
         db.rotate_memtable()?;
 
-        assert_eq!(
-            1,
-            keyspace
-                .flush_manager
-                .read()
-                .expect("lock is poisoned")
-                .len()
-        );
+        assert_eq!(1, keyspace.flush_tracker.task_count());
 
-        assert_eq!(
-            1,
-            keyspace
-                .journal_manager
-                .read()
-                .expect("lock is poisoned")
-                .sealed_journal_count()
-        );
+        assert_eq!(1, keyspace.flush_tracker.sealed_journal_count());
 
         for _ in 0..100 {
             db2.insert(nanoid::nanoid!(), "abc")?;
@@ -1091,55 +1106,20 @@ mod tests {
 
         db2.rotate_memtable()?;
 
-        assert_eq!(
-            2,
-            keyspace
-                .flush_manager
-                .read()
-                .expect("lock is poisoned")
-                .len()
-        );
+        assert_eq!(2, keyspace.flush_tracker.task_count());
 
-        assert_eq!(
-            2,
-            keyspace
-                .journal_manager
-                .read()
-                .expect("lock is poisoned")
-                .sealed_journal_count()
-        );
+        assert_eq!(2, keyspace.flush_tracker.sealed_journal_count());
 
         assert_eq!(0, db.segment_count());
         assert_eq!(0, db2.segment_count());
 
         keyspace.force_flush();
 
-        assert_eq!(
-            0,
-            keyspace
-                .flush_manager
-                .read()
-                .expect("lock is poisoned")
-                .queued_size()
-        );
+        assert_eq!(0, keyspace.flush_tracker.queued_size());
 
-        assert_eq!(
-            0,
-            keyspace
-                .flush_manager
-                .read()
-                .expect("lock is poisoned")
-                .len()
-        );
+        assert_eq!(0, keyspace.flush_tracker.task_count());
 
-        assert_eq!(
-            0,
-            keyspace
-                .journal_manager
-                .read()
-                .expect("lock is poisoned")
-                .sealed_journal_count()
-        );
+        assert_eq!(0, keyspace.flush_tracker.sealed_journal_count());
 
         assert_eq!(0, keyspace.write_buffer_size());
         assert_eq!(1, db.segment_count());
@@ -1160,32 +1140,11 @@ mod tests {
 
         assert_eq!(0, db.segment_count());
 
-        assert_eq!(
-            0,
-            keyspace
-                .journal_manager
-                .read()
-                .expect("lock is poisoned")
-                .sealed_journal_count()
-        );
+        assert_eq!(0, keyspace.flush_tracker.sealed_journal_count());
 
-        assert_eq!(
-            0,
-            keyspace
-                .flush_manager
-                .read()
-                .expect("lock is poisoned")
-                .queued_size()
-        );
+        assert_eq!(0, keyspace.flush_tracker.queued_size());
 
-        assert_eq!(
-            0,
-            keyspace
-                .flush_manager
-                .read()
-                .expect("lock is poisoned")
-                .len()
-        );
+        assert_eq!(0, keyspace.flush_tracker.task_count());
 
         for _ in 0..100 {
             db.insert(nanoid::nanoid!(), "abc")?;
@@ -1193,54 +1152,19 @@ mod tests {
 
         db.rotate_memtable()?;
 
-        assert_eq!(
-            1,
-            keyspace
-                .flush_manager
-                .read()
-                .expect("lock is poisoned")
-                .len()
-        );
+        assert_eq!(1, keyspace.flush_tracker.task_count());
 
-        assert_eq!(
-            1,
-            keyspace
-                .journal_manager
-                .read()
-                .expect("lock is poisoned")
-                .sealed_journal_count()
-        );
+        assert_eq!(1, keyspace.flush_tracker.sealed_journal_count());
 
         assert_eq!(0, db.segment_count());
 
         keyspace.force_flush();
 
-        assert_eq!(
-            0,
-            keyspace
-                .flush_manager
-                .read()
-                .expect("lock is poisoned")
-                .queued_size()
-        );
+        assert_eq!(0, keyspace.flush_tracker.queued_size());
 
-        assert_eq!(
-            0,
-            keyspace
-                .flush_manager
-                .read()
-                .expect("lock is poisoned")
-                .len()
-        );
+        assert_eq!(0, keyspace.flush_tracker.task_count());
 
-        assert_eq!(
-            0,
-            keyspace
-                .journal_manager
-                .read()
-                .expect("lock is poisoned")
-                .sealed_journal_count()
-        );
+        assert_eq!(0, keyspace.flush_tracker.sealed_journal_count());
 
         assert_eq!(0, keyspace.write_buffer_size());
         assert_eq!(1, db.segment_count());

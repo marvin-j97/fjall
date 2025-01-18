@@ -95,6 +95,7 @@ pub mod drop;
 mod error;
 mod file;
 mod flush;
+mod flush_tracker;
 mod gc;
 mod iter;
 mod journal;
@@ -102,19 +103,17 @@ mod keyspace;
 mod monitor;
 mod partition;
 mod path;
-mod recovery;
 mod snapshot_nonce;
 mod snapshot_tracker;
+mod space_tracker;
 mod tracked_snapshot;
 
 #[cfg(any(feature = "single_writer_tx", feature = "ssi_tx"))]
 mod tx;
 
 mod version;
-mod write_buffer_manager;
 
 pub(crate) type HashMap<K, V> = std::collections::HashMap<K, V, xxhash_rust::xxh3::Xxh3Builder>;
-pub(crate) type HashSet<K> = std::collections::HashSet<K, xxhash_rust::xxh3::Xxh3Builder>;
 
 pub use {
     batch::Batch,

@@ -2,14 +2,13 @@
 // This source code is licensed under both the Apache 2.0 and MIT License
 // (found in the LICENSE-* files in the repository)
 
-use super::manager::{FlushManager, Task};
+use super::manager::Task;
 use crate::{
-    batch::PartitionKey, compaction::manager::CompactionManager, journal::manager::JournalManager,
-    snapshot_tracker::SnapshotTracker, write_buffer_manager::WriteBufferManager, HashMap,
-    PartitionHandle,
+    compaction::manager::CompactionManager, flush_tracker::FlushTracker,
+    snapshot_tracker::SnapshotTracker, PartitionHandle,
 };
 use lsm_tree::{AbstractTree, Segment, SeqNo};
-use std::sync::{Arc, RwLock};
+use std::sync::Arc;
 
 /// Flushes a single segment.
 fn run_flush_worker(task: &Arc<Task>, eviction_threshold: SeqNo) -> crate::Result<Option<Segment>> {
@@ -48,7 +47,7 @@ type MultiFlushResults = Vec<crate::Result<MultiFlushResultItem>>;
 ///
 /// Each thread is responsible for the tasks of one partition.
 fn run_multi_flush(
-    partitioned_tasks: &HashMap<PartitionKey, Vec<Arc<Task>>>,
+    partitioned_tasks: Vec<Vec<Arc<Task>>>,
     eviction_threshold: SeqNo,
 ) -> MultiFlushResults {
     log::debug!("spawning {} worker threads", partitioned_tasks.len());
@@ -56,22 +55,20 @@ fn run_multi_flush(
     // NOTE: Don't trust clippy
     #[allow(clippy::needless_collect)]
     let threads = partitioned_tasks
-        .iter()
-        .map(|(partition_name, tasks)| {
-            let partition_name = partition_name.clone();
-            let tasks = tasks.clone();
-
+        .into_iter()
+        .map(|tasks| {
             std::thread::spawn(move || {
-                log::trace!(
-                    "flushing {} memtables for partition {partition_name:?}",
-                    tasks.len()
-                );
-
                 let partition = tasks
                     .first()
                     .expect("should always have at least one task")
                     .partition
                     .clone();
+
+                log::trace!(
+                    "flushing {} memtables for partition {:?}",
+                    tasks.len(),
+                    partition.name
+                );
 
                 let memtables_size: u64 = tasks
                     .iter()
@@ -87,14 +84,17 @@ fn run_multi_flush(
                     })
                     .collect::<Vec<_>>();
 
-                let created_segments = flush_workers
-                    .into_iter()
-                    .map(|t| t.join().expect("should join"))
-                    .collect::<crate::Result<Vec<_>>>()?;
+                let mut created_segments = Vec::with_capacity(flush_workers.len());
+
+                for t in flush_workers {
+                    if let Some(segment) = t.join().expect("should join")? {
+                        created_segments.push(segment);
+                    }
+                }
 
                 Ok(MultiFlushResultItem {
                     partition,
-                    created_segments: created_segments.into_iter().flatten().collect(),
+                    created_segments,
                     size: memtables_size,
                 })
             })
@@ -110,26 +110,20 @@ fn run_multi_flush(
 /// Runs flush logic.
 #[allow(clippy::too_many_lines)]
 pub fn run(
-    flush_manager: &Arc<RwLock<FlushManager>>,
-    journal_manager: &Arc<RwLock<JournalManager>>,
+    flush_tracker: &FlushTracker,
     compaction_manager: &CompactionManager,
-    write_buffer_manager: &WriteBufferManager,
     snapshot_tracker: &SnapshotTracker,
     parallelism: usize,
 ) {
-    log::debug!("write locking flush manager");
-    let mut fm = flush_manager.write().expect("lock is poisoned");
-    let partitioned_tasks = fm.collect_tasks(parallelism);
-    drop(fm);
+    log::debug!("read locking flush manager");
+    let partitioned_tasks = flush_tracker.collect_tasks(parallelism);
 
-    let task_count = partitioned_tasks.iter().map(|x| x.1.len()).sum::<usize>();
-
-    if task_count == 0 {
+    if partitioned_tasks.is_empty() {
         log::debug!("No tasks collected");
         return;
     }
 
-    for result in run_multi_flush(&partitioned_tasks, snapshot_tracker.get_seqno_safe_to_gc()) {
+    for result in run_multi_flush(partitioned_tasks, snapshot_tracker.get_seqno_safe_to_gc()) {
         match result {
             Ok(MultiFlushResultItem {
                 partition,
@@ -142,16 +136,14 @@ pub fn run(
                     log::error!("Failed to register segments: {e:?}");
                 } else {
                     log::debug!("write locking flush manager to submit results");
-                    let mut flush_manager = flush_manager.write().expect("lock is poisoned");
-
                     log::debug!(
                         "Dequeuing flush tasks: {} => {}",
                         partition.name,
                         created_segments.len()
                     );
-                    flush_manager.dequeue_tasks(partition.name.clone(), created_segments.len());
 
-                    write_buffer_manager.free(memtables_size);
+                    flush_tracker.dequeue_tasks(&partition.name, created_segments.len());
+                    flush_tracker.decrement_buffer_size(memtables_size);
 
                     for _ in 0..parallelism {
                         compaction_manager.notify(partition.clone());
@@ -165,11 +157,7 @@ pub fn run(
     }
 
     log::debug!("write locking journal manager to maybe do maintenance");
-    if let Err(e) = journal_manager
-        .write()
-        .expect("lock is poisoned")
-        .maintenance()
-    {
+    if let Err(e) = flush_tracker.maintenance() {
         log::error!("journal GC failed: {e:?}");
     }
 

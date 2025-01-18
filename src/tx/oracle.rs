@@ -5,7 +5,7 @@ use super::conflict_manager::ConflictManager;
 use lsm_tree::SequenceNumberCounter;
 use std::collections::BTreeMap;
 use std::fmt;
-use std::sync::{Mutex, MutexGuard, PoisonError};
+use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 
 pub enum CommitOutcome<E> {
     Ok,
@@ -16,7 +16,7 @@ pub enum CommitOutcome<E> {
 pub struct Oracle {
     pub(super) write_serialize_lock: Mutex<BTreeMap<u64, ConflictManager>>,
     pub(super) seqno: SequenceNumberCounter,
-    pub(super) snapshot_tracker: SnapshotTracker,
+    pub(super) snapshot_tracker: Arc<SnapshotTracker>,
 }
 
 impl Oracle {
