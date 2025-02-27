@@ -58,14 +58,14 @@ fn main() -> fjall::Result<()> {
                 loop {
                     let mut tx = keyspace.write_tx();
 
-                    // TODO: NOTE:
-                    // Tombstones will add up over time, making first KV slower
-                    // Something like SingleDelete https://github.com/facebook/rocksdb/wiki/Single-Delete
-                    // would be good for this type of workload
+                    // NOTE:
+                    // Tombstones will add up over time with `remove`, making first KV slower
+                    // and growing disk usage. `remove_weak` is used to prevent those
+                    // tombstones from building up.
                     if let Some((key, _)) = tx.first_key_value(&tasks)? {
                         let task_id = std::str::from_utf8(&key).unwrap().to_owned();
 
-                        tx.remove(&tasks, key);
+                        tx.remove_weak(&tasks, key);
 
                         tx.commit()?;
 

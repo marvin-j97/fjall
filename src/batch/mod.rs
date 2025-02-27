@@ -68,6 +68,16 @@ impl Batch {
             .push(Item::new(p.name.clone(), key, vec![], ValueType::Tombstone));
     }
 
+    /// Adds a weak tombstone marker for a key
+    pub fn remove_weak<K: Into<UserKey>>(&mut self, p: &PartitionHandle, key: K) {
+        self.data.push(Item::new(
+            p.name.clone(),
+            key,
+            vec![],
+            ValueType::WeakTombstone,
+        ));
+    }
+
     /// Commits the batch to the [`Keyspace`] atomically
     ///
     /// # Errors
